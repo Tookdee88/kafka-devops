@@ -1,6 +1,6 @@
-FROM flant/shell-operator:v1.0.0-beta.12-alpine3.11
+FROM flant/shell-operator:v1.0.0-beta.12
 
-RUN apk --no-cache add curl
+RUN apt-get update && apt-get install -y curl
 
 RUN curl -L --http1.1 https://cnfl.io/ccloud-cli | sh -s -- -b /usr/bin v1.16.0
 
