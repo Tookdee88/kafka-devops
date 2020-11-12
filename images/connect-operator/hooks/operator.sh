@@ -2,7 +2,7 @@
 
 source $SHELL_OPERATOR_HOOKS_DIR/lib/common.sh
 
-BASE_URL=${BASE_URL:-http://connect}
+BASE_URL=${BASE_URL:-http://kafka-connect:8083}
 
 # Converts the Java properties style files located
 # in /etc/config/connect-operator into a string of arguments that can be passed
@@ -48,7 +48,7 @@ function delete_connector() {
 
   DESIRED_CONNECTOR_CONFIG=$(eval $TEMPLATE_COMMAND | jq -c '.config')
   CONNECTOR_NAME=$(echo $DESIRED_CONNECTOR_CONFIG | jq -r '.name')
-  echo "deleting connector $CONNECTOR_NAME"
+  echo "Deleting connector $CONNECTOR_NAME"
 	curl -s -o /dev/null -XDELETE "$BASE_URL/connectors/$CONNECTOR_NAME"
 }
 
@@ -69,25 +69,44 @@ function apply_connector() {
 
   DESIRED_CONNECTOR_CONFIG=$(eval $TEMPLATE_COMMAND)
   CONNECTOR_NAME=$(echo $DESIRED_CONNECTOR_CONFIG | jq -r '.name')
-	CONNECTOR_EXISTS_RESULT=$(curl -s -o /dev/null -I -w "%{http_code}" -XGET -H "Accpet: application/json" "$BASE_URL/connectors/$CONNECTOR_NAME")
 
-  [[ "$CONNECTOR_EXISTS_RESULT" == "200" ]] && {
+	for i in $(seq 1 5); do
+	  echo "Checking connector $CONNECTOR_NAME exists"
+    CONNECTOR_EXISTS_RESULT=$(curl -s -o /dev/null -I -w "%{http_code}" -XGET -H "Accpet: application/json" "$BASE_URL/connectors/$CONNECTOR_NAME")
+    if [[ "$CONNECTOR_EXISTS_RESULT" != "409" ]] ; then break; fi
+    sleep 5
+  done
+
+  if [[ "$CONNECTOR_EXISTS_RESULT" == "200" ]]; then
 		CURRENT_CONNECTOR_CONFIG=$(curl -s -XGET -H "Content-Type: application/json" "$BASE_URL/connectors/$CONNECTOR_NAME/config")
-		if cmp -s <(echo $DESIRED_CONNECTOR_CONFIG | jq -S -c .) <(echo $CURRENT_CONNECTOR_CONFIG | jq -S -c .); then
+		if cmp -s <(echo $DESIRED_CONNECTOR_CONFIG | jq -S -c '.config') <(echo $CURRENT_CONNECTOR_CONFIG | jq -S -c .); then
 			echo "No config changes for $CONNECTOR_NAME"
 		else
 			echo "Updating existing connector config: $CONNECTOR_NAME"
       DESIRED_CONNECTOR_CONFIG=$(echo $DESIRED_CONNECTOR_CONFIG | jq -S -c '.config')
-    	curl -s -o /dev/null -XPUT -H "Content-Type: application/json" --data "$DESIRED_CONNECTOR_CONFIG" "$BASE_URL/connectors/$CONNECTOR_NAME/config"
+    	curl -s -XPUT -H "Content-Type: application/json" --data "$DESIRED_CONNECTOR_CONFIG" "$BASE_URL/connectors/$CONNECTOR_NAME/config"
 		fi
-  } || {
-    echo "creating new connector: $CONNECTOR_NAME"
-    curl -s -o /dev/null -XPOST -H "Content-Type: application/json" --data "$DESIRED_CONNECTOR_CONFIG" "$BASE_URL/connectors"
-  }
+	elif [[ "$CONNECTOR_EXISTS_RESULT" == "404" ]]; then
+    echo "Creating new connector: $CONNECTOR_NAME"
+    curl -s -XPOST -H "Content-Type: application/json" --data "$DESIRED_CONNECTOR_CONFIG" "$BASE_URL/connectors"
+  fi
+}
+
+function wait_kafka_connect() {
+  echo "Waiting for Kafka Connect"
+  while : ; do
+    curl_status=$(curl -s -o /dev/null -w %{http_code} "$BASE_URL/connectors")
+    echo -e $(date) " Kafka Connect listener HTTP state: " $$curl_status " (waiting for 200)"
+    if [ $curl_status -eq 200 ] ; then
+      break
+    fi
+    sleep 5
+  done
 }
 
 hook::run() {
   if [ ! -z ${DEBUG+x} ]; then set -x; fi
+  wait_kafka_connect
   load_configs
 
   # shell-operator gives us a wrapper around the resource we are monitoring
@@ -95,32 +114,36 @@ hook::run() {
   # The data model for this object can be found here:
   # https://github.com/flant/shell-operator/blob/master/pkg/hook/binding_context/binding_context.go
 
-  # so first we pull out the type of update we are getting from Kubernetes
-  TYPE=$(jq -r .[0].type $BINDING_CONTEXT_PATH)
-
-  # A "Syncronization" Type event indicates we need to syncronize with the
-  # current state of the resource, otherwise we'll get an "Event" type event.
-  if [[ "$TYPE" == "Synchronization" ]]; then
-    # In the Syncronization phase, we maybe receive many object instances,
-    # so we pull out each one and process them indpendently
-    KEYS=$(jq -c -r '.[0].objects | .[].object.data | keys | .[]' $BINDING_CONTEXT_PATH)
-   for KEY in $KEYS; do
-   	CONFIG=$(jq -c -r ".[].objects | .[].object.data | select(has(\"$KEY\")) | .\"$KEY\"" $BINDING_CONTEXT_PATH)
-   	apply_connector "$CONFIG"
-   done
-  elif [[ "$TYPE" == "Event" ]]; then
-    # The EVENT variable will containe either Added, Updated, or Deleted in the
-    # case where TYPE == Event
-    EVENT=$(jq -r .[0].watchEvent $BINDING_CONTEXT_PATH)
-    DATA=$(jq -r '.[0].object.data' $BINDING_CONTEXT_PATH)
-    KEY=$(echo $DATA | jq -r -c 'keys | .[0]')
-    CONFIG=$(echo $DATA | jq -r -c ".\"$KEY\"")
-    if [[ "$EVENT" == "Deleted" ]]; then
-      delete_connector "$CONFIG"
-    else
-     apply_connector "$CONFIG"
+  ARRAY_COUNT=`jq -r '. | length-1' $BINDING_CONTEXT_PATH`
+  for I in `seq 0 $ARRAY_COUNT`
+  do
+    export INDEX=$I
+    TYPE=$(jq -r ".[$INDEX].type" $BINDING_CONTEXT_PATH)
+    if [[ "$TYPE" == "Synchronization" ]]; then
+      echo "Received binding context type Synchronization"
+      # In the Syncronization phase, we maybe receive many object instances,
+      # so we pull out each one and process them indpendently
+      KEYS=$(jq -c -r ".[$INDEX].objects | .[].object.data | keys | .[]" $BINDING_CONTEXT_PATH)
+      for KEY in $KEYS; do
+        CONFIG=$(jq -c -r ".[$INDEX].objects | .[].object.data | select(has(\"$KEY\")) | .\"$KEY\"" $BINDING_CONTEXT_PATH)
+        apply_connector "$CONFIG"
+      done
+    elif [[ "$TYPE" == "Event" ]]; then
+      # The EVENT variable will containe either Added, Updated, or Deleted in the
+      # case where TYPE == Event
+      EVENT=$(jq -r ".[$INDEX].watchEvent" $BINDING_CONTEXT_PATH)
+      DATA=$(jq -r ".[$INDEX].object.data" $BINDING_CONTEXT_PATH)
+      KEY=$(echo $DATA | jq -r -c 'keys | .[0]')
+      CONFIG=$(echo $DATA | jq -r -c ".\"$KEY\"")
+      echo "Received binding context type event $EVENT"
+      if [[ "$EVENT" == "Deleted" ]]; then
+        delete_connector "$CONFIG"
+      else
+       apply_connector "$CONFIG"
+      fi
     fi
-  fi
+  done
+
   if [ ! -z ${DEBUG+x} ]; then set +x; fi
 }
 

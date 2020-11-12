@@ -15,7 +15,7 @@ kubernetes:
       destination: connect
   namespace:
     nameSelector:
-      matchNames: ["default"]
+      matchNames: [$NAMESPACE]
   jqFilter: ".data"
 EOF
 }
